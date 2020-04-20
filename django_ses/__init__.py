@@ -109,7 +109,7 @@ class SESBackend(BaseEmailBackend):
             if not self.fail_silently:
                 raise
 
-    def send_message(self, message, source=None):
+    def _send_message(self, message, source=None):
         # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
         # is not None, append the appropriate header to the message so that
         # SES knows which configuration set it belongs to.
@@ -237,7 +237,7 @@ class SESBackend(BaseEmailBackend):
         num_sent = 0
         source = settings.AWS_SES_RETURN_PATH
         for message in email_messages:
-            sent, message, exc = self.send_message(message, source=source)
+            sent, message, exc = self._send_message(message, source=source)
             if not sent and not self.fail_silently:
                 reraise(*exc)
             if sent:
