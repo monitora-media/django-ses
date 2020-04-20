@@ -1,10 +1,12 @@
 import logging
+import sys
 
 from django.core.mail.backends.base import BaseEmailBackend
 from django_ses import settings
 
 from boto.regioninfo import RegionInfo
 from boto.ses import SESConnection
+from six import reraise
 
 from datetime import datetime, timedelta
 from time import sleep
@@ -107,6 +109,119 @@ class SESBackend(BaseEmailBackend):
             if not self.fail_silently:
                 raise
 
+    def send_message(self, message, source=None):
+        # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
+        # is not None, append the appropriate header to the message so that
+        # SES knows which configuration set it belongs to.
+        #
+        # If settings.AWS_SES_CONFIGURATION_SET is a callable, pass it the
+        # message object and dkim settings and expect it to return a string
+        # containing the SES Configuration Set name.
+        if (settings.AWS_SES_CONFIGURATION_SET and
+                'X-SES-CONFIGURATION-SET' not in message.extra_headers):
+            if callable(settings.AWS_SES_CONFIGURATION_SET):
+                message.extra_headers[
+                    'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET(
+                        message,
+                        dkim_domain=self.dkim_domain,
+                        dkim_key=self.dkim_key,
+                        dkim_selector=self.dkim_selector,
+                        dkim_headers=self.dkim_headers
+                    )
+            else:
+                message.extra_headers[
+                    'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
+
+        # Automatic throttling. Assumes that this is the only SES client
+        # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
+        # factor to apply to the rate limit, with a default of 0.5 to stay
+        # well below the actual SES throttle.
+        # Set the setting to 0 or None to disable throttling.
+        if self._throttle:
+            global recent_send_times
+
+            now = datetime.now()
+
+            # Get and cache the current SES max-per-second rate limit
+            # returned by the SES API.
+            rate_limit = self.get_rate_limit()
+            logger.debug(u"send_messages.throttle rate_limit='{}'".format(rate_limit))
+
+            # Prune from recent_send_times anything more than a few seconds
+            # ago. Even though SES reports a maximum per-second, the way
+            # they enforce the limit may not be on a one-second window.
+            # To be safe, we use a two-second window (but allow 2 times the
+            # rate limit) and then also have a default rate limit factor of
+            # 0.5 so that we really limit the one-second amount in two
+            # seconds.
+            window = 2.0  # seconds
+            window_start = now - timedelta(seconds=window)
+            new_send_times = []
+            for time in recent_send_times:
+                if time > window_start:
+                    new_send_times.append(time)
+            recent_send_times = new_send_times
+
+            # If the number of recent send times in the last 1/_throttle
+            # seconds exceeds the rate limit, add a delay.
+            # Since I'm not sure how Amazon determines at exactly what
+            # point to throttle, better be safe than sorry and let in, say,
+            # half of the allowed rate.
+            if len(new_send_times) > rate_limit * window * self._throttle:
+                # Sleep the remainder of the window period.
+                delta = now - new_send_times[0]
+                total_seconds = (delta.microseconds + (delta.seconds +
+                                                       delta.days * 24 * 3600) * 10**6) / 10**6
+                delay = window - total_seconds
+                if delay > 0:
+                    sleep(delay)
+
+            recent_send_times.append(now)
+            # end of throttling
+
+        exc, sent = None, True
+        try:
+            response = self.connection.send_raw_email(
+                source=source or message.from_email,
+                destinations=message.recipients(),
+                raw_message=dkim_sign(message.message().as_string(),
+                                      dkim_key=self.dkim_key,
+                                      dkim_domain=self.dkim_domain,
+                                      dkim_selector=self.dkim_selector,
+                                      dkim_headers=self.dkim_headers)
+            )
+            message.extra_headers['status'] = 200
+            message.extra_headers['message_id'] = response[
+                'SendRawEmailResponse']['SendRawEmailResult']['MessageId']
+            message.extra_headers['request_id'] = response[
+                'SendRawEmailResponse']['ResponseMetadata']['RequestId']
+            if 'X-SES-CONFIGURATION-SET' in message.extra_headers:
+                logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' ses-configuration-set='{}'".format(
+                    message.from_email,
+                    ", ".join(message.recipients()),
+                    message.extra_headers['message_id'],
+                    message.extra_headers['request_id'],
+                    message.extra_headers['X-SES-CONFIGURATION-SET']
+                ))
+            else:
+                logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
+                    message.from_email,
+                    ", ".join(message.recipients()),
+                    message.extra_headers['message_id'],
+                    message.extra_headers['request_id']
+                ))
+
+        except SESConnection.ResponseError as err:
+            # Store failure information so to post process it if required
+            error_keys = ['status', 'reason', 'body', 'request_id',
+                          'error_code', 'error_message']
+            for key in error_keys:
+                message.extra_headers[key] = getattr(err, key, None)
+            exc = sys.exc_info()
+            sent = False
+        finally:
+            return sent, message, exc
+
     def send_messages(self, email_messages):
         """Sends one or more EmailMessage objects and returns the number of
         email messages sent.
@@ -122,115 +237,11 @@ class SESBackend(BaseEmailBackend):
         num_sent = 0
         source = settings.AWS_SES_RETURN_PATH
         for message in email_messages:
-            # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
-            # is not None, append the appropriate header to the message so that
-            # SES knows which configuration set it belongs to.
-            #
-            # If settings.AWS_SES_CONFIGURATION_SET is a callable, pass it the
-            # message object and dkim settings and expect it to return a string
-            # containing the SES Configuration Set name.
-            if (settings.AWS_SES_CONFIGURATION_SET and
-                'X-SES-CONFIGURATION-SET' not in message.extra_headers):
-                if callable(settings.AWS_SES_CONFIGURATION_SET):
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET(
-                            message,
-                            dkim_domain=self.dkim_domain,
-                            dkim_key=self.dkim_key,
-                            dkim_selector=self.dkim_selector,
-                            dkim_headers=self.dkim_headers
-                        )
-                else:
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
-
-            # Automatic throttling. Assumes that this is the only SES client
-            # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
-            # factor to apply to the rate limit, with a default of 0.5 to stay
-            # well below the actual SES throttle.
-            # Set the setting to 0 or None to disable throttling.
-            if self._throttle:
-                global recent_send_times
-
-                now = datetime.now()
-
-                # Get and cache the current SES max-per-second rate limit
-                # returned by the SES API.
-                rate_limit = self.get_rate_limit()
-                logger.debug(u"send_messages.throttle rate_limit='{}'".format(rate_limit))
-
-                # Prune from recent_send_times anything more than a few seconds
-                # ago. Even though SES reports a maximum per-second, the way
-                # they enforce the limit may not be on a one-second window.
-                # To be safe, we use a two-second window (but allow 2 times the
-                # rate limit) and then also have a default rate limit factor of
-                # 0.5 so that we really limit the one-second amount in two
-                # seconds.
-                window = 2.0  # seconds
-                window_start = now - timedelta(seconds=window)
-                new_send_times = []
-                for time in recent_send_times:
-                    if time > window_start:
-                        new_send_times.append(time)
-                recent_send_times = new_send_times
-
-                # If the number of recent send times in the last 1/_throttle
-                # seconds exceeds the rate limit, add a delay.
-                # Since I'm not sure how Amazon determines at exactly what
-                # point to throttle, better be safe than sorry and let in, say,
-                # half of the allowed rate.
-                if len(new_send_times) > rate_limit * window * self._throttle:
-                    # Sleep the remainder of the window period.
-                    delta = now - new_send_times[0]
-                    total_seconds = (delta.microseconds + (delta.seconds +
-                                     delta.days * 24 * 3600) * 10**6) / 10**6
-                    delay = window - total_seconds
-                    if delay > 0:
-                        sleep(delay)
-
-                recent_send_times.append(now)
-                # end of throttling
-
-            try:
-                response = self.connection.send_raw_email(
-                    source=source or message.from_email,
-                    destinations=message.recipients(),
-                    raw_message=dkim_sign(message.message().as_string(),
-                                          dkim_key=self.dkim_key,
-                                          dkim_domain=self.dkim_domain,
-                                          dkim_selector=self.dkim_selector,
-                                          dkim_headers=self.dkim_headers)
-                )
-                message.extra_headers['status'] = 200
-                message.extra_headers['message_id'] = response[
-                    'SendRawEmailResponse']['SendRawEmailResult']['MessageId']
-                message.extra_headers['request_id'] = response[
-                    'SendRawEmailResponse']['ResponseMetadata']['RequestId']
+            sent, message, exc = self.send_message(message, source=source)
+            if not sent and not self.fail_silently:
+                reraise(*exc)
+            if sent:
                 num_sent += 1
-                if 'X-SES-CONFIGURATION-SET' in message.extra_headers:
-                    logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' ses-configuration-set='{}'".format(
-                        message.from_email,
-                        ", ".join(message.recipients()),
-                        message.extra_headers['message_id'],
-                        message.extra_headers['request_id'],
-                        message.extra_headers['X-SES-CONFIGURATION-SET']
-                    ))
-                else:
-                    logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
-                        message.from_email,
-                        ", ".join(message.recipients()),
-                        message.extra_headers['message_id'],
-                        message.extra_headers['request_id']
-                    ))
-
-            except SESConnection.ResponseError as err:
-                # Store failure information so to post process it if required
-                error_keys = ['status', 'reason', 'body', 'request_id',
-                              'error_code', 'error_message']
-                for key in error_keys:
-                    message.extra_headers[key] = getattr(err, key, None)
-                if not self.fail_silently:
-                    raise
 
         if new_conn_created:
             self.close()
