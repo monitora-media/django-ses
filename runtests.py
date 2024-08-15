@@ -29,9 +29,10 @@ settings.configure(
     MIDDLEWARE_CLASSES=('django.middleware.common.CommonMiddleware',
                         'django.middleware.csrf.CsrfViewMiddleware'),
     ROOT_URLCONF='tests.test_urls',
+    SECRET_KEY="not-secret",
 )
 
 django.setup()
 
 # Start the test suite now that the settings are configured.
-call_command("test", "tests")
+call_command("test", "tests", verbosity=3)

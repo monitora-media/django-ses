@@ -1,88 +1,88 @@
+from datetime import datetime
+
+import pytz
 from django.test import TestCase
 
-from django_ses.views import (emails_parse, stats_to_list, quota_parse,
-                              sum_stats)
+from django_ses.views import emails_parse, stats_to_list, sum_stats
 
 # Mock of what boto's SESConnection.get_send_statistics() returns
 STATS_DICT = {
-    u'SendDataPoints': [
+    'SendDataPoints': [
         {
-            u'Bounces': u'1',
-            u'Complaints': u'0',
-            u'DeliveryAttempts': u'11',
-            u'Rejects': u'0',
-            u'Timestamp': u'2011-02-28T13:50:00Z',
+            'Bounces': 1,
+            'Complaints': 0,
+            'DeliveryAttempts': 11,
+            'Rejects': 0,
+            'Timestamp':
+                datetime(2011, 2, 28, 13, 50, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'1',
-            u'Complaints': u'0',
-            u'DeliveryAttempts': u'3',
-            u'Rejects': u'0',
-            u'Timestamp': u'2011-02-24T23:35:00Z',
+            'Bounces': 1,
+            'Complaints': 0,
+            'DeliveryAttempts': 3,
+            'Rejects': 0,
+            'Timestamp':
+                datetime(2011, 2, 24, 23, 35, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'0',
-            u'Complaints': u'2',
-            u'DeliveryAttempts': u'8',
-            u'Rejects': u'0',
-            u'Timestamp': u'2011-02-24T16:35:00Z',
+            'Bounces': 0,
+            'Complaints': 2,
+            'DeliveryAttempts': 8,
+            'Rejects': 0,
+            'Timestamp':
+                datetime(2011, 2, 24, 16, 35, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'0',
-            u'Complaints': u'2',
-            u'DeliveryAttempts': u'33',
-            u'Rejects': u'0',
-            u'Timestamp': u'2011-02-25T20:35:00Z',
+            'Bounces': 0,
+            'Complaints': 2,
+            'DeliveryAttempts': 33,
+            'Rejects': 0,
+            'Timestamp':
+                datetime(2011, 2, 25, 20, 35, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'0',
-            u'Complaints': u'0',
-            u'DeliveryAttempts': u'3',
-            u'Rejects': u'3',
-            u'Timestamp': u'2011-02-28T23:35:00Z',
+            'Bounces': 0,
+            'Complaints': 0,
+            'DeliveryAttempts': 3,
+            'Rejects': 3,
+            'Timestamp':
+                datetime(2011, 2, 28, 23, 35, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'0',
-            u'Complaints': u'0',
-            u'DeliveryAttempts': u'2',
-            u'Rejects': u'3',
-            u'Timestamp': u'2011-02-25T22:50:00Z',
+            'Bounces': 0,
+            'Complaints': 0,
+            'DeliveryAttempts': 2,
+            'Rejects': 3,
+            'Timestamp':
+                datetime(2011, 2, 25, 22, 50, tzinfo=pytz.utc),
         },
         {
-            u'Bounces': u'0',
-            u'Complaints': u'0',
-            u'DeliveryAttempts': u'6',
-            u'Rejects': u'0',
-            u'Timestamp': u'2011-03-01T13:20:00Z',
+            'Bounces': 0,
+            'Complaints': 0,
+            'DeliveryAttempts': 6,
+            'Rejects': 0,
+            'Timestamp':
+                datetime(2011, 3, 1, 13, 20, tzinfo=pytz.utc),
         },
     ],
 }
 
-QUOTA_DICT = {
-    u'GetSendQuotaResponse': {
-        u'GetSendQuotaResult': {
-            u'Max24HourSend': u'10000.0',
-            u'MaxSendRate': u'5.0',
-            u'SentLast24Hours': u'1677.0'
-        },
-        u'ResponseMetadata': {
-            u'RequestId': u'8f100233-44e7-11e0-a926-a198963635d8'
-        }
-    }
-}
-
 VERIFIED_EMAIL_DICT = {
-    u'ListVerifiedEmailAddressesResponse': {
-        u'ListVerifiedEmailAddressesResult': {
-            u'VerifiedEmailAddresses': [
-                u'test2@example.com',
-                u'test1@example.com',
-                u'test3@example.com'
-            ]
+    'VerifiedEmailAddresses': [
+        'test2@example.com',
+        'test1@example.com',
+        'test3@example.com'
+    ],
+    'ResponseMetadata': {
+        'RequestId': '9afe9c18-44ed-11e0-802a-25a1a14c5a6e',
+        'HTTPStatusCode': 200,
+        'HTTPHeaders': {
+            'x-amzn-requestid': '9afe9c18-44ed-11e0-802a-25a1a14c5a6e',
+            'content-type': 'text/xml',
+            'content-length': '536',
+            'date': 'Thu, 20 Aug 2020 05:06:35 GMT'
         },
-        u'ResponseMetadata': {
-            u'RequestId': u'9afe9c18-44ed-11e0-802a-25a1a14c5a6e'
-        }
+        'RetryAttempts': 0
     }
 }
 
@@ -90,59 +90,65 @@ VERIFIED_EMAIL_DICT = {
 class StatParsingTest(TestCase):
     def setUp(self):
         self.stats_dict = STATS_DICT
-        self.quota_dict = QUOTA_DICT
         self.emails_dict = VERIFIED_EMAIL_DICT
 
     def test_stat_to_list(self):
         expected_list = [
             {
-                u'Bounces': u'0',
-                u'Complaints': u'2',
-                u'DeliveryAttempts': u'8',
-                u'Rejects': u'0',
-                u'Timestamp': u'2011-02-24T16:35:00Z',
+                'Bounces': 0,
+                'Complaints': 2,
+                'DeliveryAttempts': 8,
+                'Rejects': 0,
+                'Timestamp':
+                    datetime(2011, 2, 24, 16, 35, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'1',
-                u'Complaints': u'0',
-                u'DeliveryAttempts': u'3',
-                u'Rejects': u'0',
-                u'Timestamp': u'2011-02-24T23:35:00Z',
+                'Bounces': 1,
+                'Complaints': 0,
+                'DeliveryAttempts': 3,
+                'Rejects': 0,
+                'Timestamp':
+                    datetime(2011, 2, 24, 23, 35, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'0',
-                u'Complaints': u'2',
-                u'DeliveryAttempts': u'33',
-                u'Rejects': u'0',
-                u'Timestamp': u'2011-02-25T20:35:00Z',
+                'Bounces': 0,
+                'Complaints': 2,
+                'DeliveryAttempts': 33,
+                'Rejects': 0,
+                'Timestamp':
+                    datetime(2011, 2, 25, 20, 35, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'0',
-                u'Complaints': u'0',
-                u'DeliveryAttempts': u'2',
-                u'Rejects': u'3',
-                u'Timestamp': u'2011-02-25T22:50:00Z',
+                'Bounces': 0,
+                'Complaints': 0,
+                'DeliveryAttempts': 2,
+                'Rejects': 3,
+                'Timestamp':
+                    datetime(2011, 2, 25, 22, 50, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'1',
-                u'Complaints': u'0',
-                u'DeliveryAttempts': u'11',
-                u'Rejects': u'0',
-                u'Timestamp': u'2011-02-28T13:50:00Z',
+                'Bounces': 1,
+                'Complaints': 0,
+                'DeliveryAttempts': 11,
+                'Rejects': 0,
+                'Timestamp':
+                    datetime(2011, 2, 28, 13, 50, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'0',
-                u'Complaints': u'0',
-                u'DeliveryAttempts': u'3',
-                u'Rejects': u'3',
-                u'Timestamp': u'2011-02-28T23:35:00Z',
+                'Bounces': 0,
+                'Complaints': 0,
+                'DeliveryAttempts': 3,
+                'Rejects': 3,
+                'Timestamp':
+                    datetime(2011, 2, 28, 23, 35, tzinfo=pytz.utc),
             },
             {
-                u'Bounces': u'0',
-                u'Complaints': u'0',
-                u'DeliveryAttempts': u'6',
-                u'Rejects': u'0',
-                u'Timestamp': u'2011-03-01T13:20:00Z',
+                'Bounces': 0,
+                'Complaints': 0,
+                'DeliveryAttempts': 6,
+                'Rejects': 0,
+                'Timestamp':
+                    datetime(2011, 3, 1, 13, 20, tzinfo=pytz.utc),
             },
         ]
         actual = stats_to_list(self.stats_dict, localize=False)
@@ -150,21 +156,11 @@ class StatParsingTest(TestCase):
         self.assertEqual(len(actual), len(expected_list))
         self.assertEqual(actual, expected_list)
 
-    def test_quota_parse(self):
-        expected = {
-            u'Max24HourSend': u'10000.0',
-            u'MaxSendRate': u'5.0',
-            u'SentLast24Hours': u'1677.0',
-        }
-        actual = quota_parse(self.quota_dict)
-
-        self.assertEqual(actual, expected)
-
     def test_emails_parse(self):
         expected_list = [
-            u'test1@example.com',
-            u'test2@example.com',
-            u'test3@example.com',
+            'test1@example.com',
+            'test2@example.com',
+            'test3@example.com',
         ]
         actual = emails_parse(self.emails_dict)
 

@@ -1,24 +1,23 @@
-# coding=utf-8
-
 import logging
-import sys
-from time import sleep
 from datetime import datetime, timedelta
-from six import reraise
+from time import sleep
+import sys
+from typing import Any
 
 import boto3
 from botocore.vendored.requests.packages.urllib3.exceptions import ResponseError
-
+from django.core.mail import EmailMessage
 from django.core.mail.backends.base import BaseEmailBackend
+
 from django_ses import settings
 
+try:
+    import importlib.metadata as importlib_metadata
+except ModuleNotFoundError:
+    # Shim for Python 3.7. Remove when support is dropped.
+    import importlib_metadata
 
-default_app_config = 'django_ses.apps.DjangoSESConfig'
-
-# When changing this, remember to change it in setup.py
-VERSION = (1, 0, 2)
-__version__ = '.'.join([str(x) for x in VERSION])
-__author__ = 'Harry Marr'
+__version__ = importlib_metadata.version(__name__)
 __all__ = ('SESBackend',)
 
 # These would be nice to make class-level variables, but the backend is
@@ -49,29 +48,59 @@ def dkim_sign(message, dkim_domain=None, dkim_key=None, dkim_selector=None, dkim
     return message
 
 
+def cast_nonzero_to_float(val):
+    """Cast nonzero number to float; on zero or None, return None"""
+    if not val:
+        return None
+    return float(val)
+
+
 class SESBackend(BaseEmailBackend):
     """A Django Email backend that uses Amazon's Simple Email Service.
     """
 
-    def __init__(self, fail_silently=False, aws_access_key=None,
-                 aws_secret_key=None, aws_region_name=None,
-                 aws_region_endpoint=None, aws_auto_throttle=None,
-                 dkim_domain=None, dkim_key=None, dkim_selector=None,
-                 dkim_headers=None, **kwargs):
+    def __init__(self, fail_silently=False, aws_session_profile=None, aws_access_key=None,
+                 aws_secret_key=None, aws_session_token=None, aws_region_name=None,
+                 aws_region_endpoint=None, aws_auto_throttle=None, aws_config=None,
+                 dkim_domain=None, dkim_key=None, dkim_selector=None, dkim_headers=None,
+                 ses_source_arn=None, ses_from_arn=None, ses_return_path_arn=None,
+                 use_ses_v2=False,
+                 **kwargs
+                 ):
 
         super(SESBackend, self).__init__(fail_silently=fail_silently, **kwargs)
+        self._session_profile = aws_session_profile or settings.AWS_SESSION_PROFILE
         self._access_key_id = aws_access_key or settings.ACCESS_KEY
         self._access_key = aws_secret_key or settings.SECRET_KEY
+        self._session_token = aws_session_token or settings.SESSION_TOKEN
         self._region_name = aws_region_name if aws_region_name else settings.AWS_SES_REGION_NAME
         self._endpoint_url = aws_region_endpoint if aws_region_endpoint else settings.AWS_SES_REGION_ENDPOINT_URL
-        self._throttle = aws_auto_throttle or settings.AWS_SES_AUTO_THROTTLE
+        self._throttle = cast_nonzero_to_float(
+            aws_auto_throttle or settings.AWS_SES_AUTO_THROTTLE)
+        self._config = aws_config or settings.AWS_SES_CONFIG
 
         self.dkim_domain = dkim_domain or settings.DKIM_DOMAIN
         self.dkim_key = dkim_key or settings.DKIM_PRIVATE_KEY
         self.dkim_selector = dkim_selector or settings.DKIM_SELECTOR
         self.dkim_headers = dkim_headers or settings.DKIM_HEADERS
 
+        self.ses_source_arn = ses_source_arn or settings.AWS_SES_SOURCE_ARN
+        self.ses_from_arn = ses_from_arn or settings.AWS_SES_FROM_ARN
+        self.ses_return_path_arn = ses_return_path_arn or settings.AWS_SES_RETURN_PATH_ARN
+
+        self._use_ses_v2 = use_ses_v2 or settings.USE_SES_V2
+
         self.connection = None
+
+    def create_session(self) -> boto3.Session:
+        if self._session_profile:
+            return boto3.Session(profile_name=self._session_profile)
+
+        return boto3.Session(
+            aws_access_key_id=self._access_key_id,
+            aws_secret_access_key=self._access_key,
+            aws_session_token=self._session_token,
+        )
 
     def open(self):
         """Create a connection to the AWS API server. This can be reused for
@@ -81,12 +110,11 @@ class SESBackend(BaseEmailBackend):
             return False
 
         try:
-            self.connection = boto3.client(
-                'ses',
-                aws_access_key_id=self._access_key_id,
-                aws_secret_access_key=self._access_key,
+            self.connection = self.create_session().client(
+                "sesv2" if self._use_ses_v2 else "ses",
                 region_name=self._region_name,
                 endpoint_url=self._endpoint_url,
+                config=self._config,
             )
 
         except Exception:
@@ -98,7 +126,37 @@ class SESBackend(BaseEmailBackend):
         """
         self.connection = None
 
-    def _send_message(self, message, source=None):
+    def send_messages(self, email_messages):
+        """Sends one or more EmailMessage objects and returns the number of
+        email messages sent.
+        """
+        if not email_messages:
+            return
+
+        new_conn_created = self.open()
+        if not self.connection:
+            # Failed silently
+            return
+
+        num_sent = 0
+
+        for message in email_messages:
+            sent, _, exc_info = self._send_message(
+                message, source=settings.AWS_SES_FROM_EMAIL)
+
+            if sent:
+                self.num_sent += 1
+            elif not self.fail_silently:
+                raise exc_info[0].with_traceback(exc_info[1], exc_info[2])
+
+        if new_conn_created:
+            self.close()
+
+        return num_sent
+
+    def _send_message(self, message, source: str | None = None) -> tuple[bool, EmailMessage, Any | None]:
+        email_feedback = settings.AWS_SES_RETURN_PATH
+
         # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
         # is not None, append the appropriate header to the message so that
         # SES knows which configuration set it belongs to.
@@ -116,9 +174,10 @@ class SESBackend(BaseEmailBackend):
                         dkim_key=self.dkim_key,
                         dkim_selector=self.dkim_selector,
                         dkim_headers=self.dkim_headers
-                    )
+                )
             else:
-                message.extra_headers['X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
+                message.extra_headers[
+                    'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
 
         # Automatic throttling. Assumes that this is the only SES client
         # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
@@ -126,67 +185,25 @@ class SESBackend(BaseEmailBackend):
         # well below the actual SES throttle.
         # Set the setting to 0 or None to disable throttling.
         if self._throttle:
-            global recent_send_times
+            self._update_throttling()
 
-            now = datetime.now()
+        kwargs = self._get_send_email_parameters(
+            message, source, email_feedback)
 
-            # Get and cache the current SES max-per-second rate limit
-            # returned by the SES API.
-            rate_limit = self.get_rate_limit()
-            logger.debug(u"send_messages.throttle rate_limit='{}'".format(rate_limit))
+        exc_info, sent = None, True
 
-            # Prune from recent_send_times anything more than a few seconds
-            # ago. Even though SES reports a maximum per-second, the way
-            # they enforce the limit may not be on a one-second window.
-            # To be safe, we use a two-second window (but allow 2 times the
-            # rate limit) and then also have a default rate limit factor of
-            # 0.5 so that we really limit the one-second amount in two
-            # seconds.
-            window = 2.0  # seconds
-            window_start = now - timedelta(seconds=window)
-            new_send_times = []
-            for time in recent_send_times:
-                if time > window_start:
-                    new_send_times.append(time)
-            recent_send_times = new_send_times
-
-            # If the number of recent send times in the last 1/_throttle
-            # seconds exceeds the rate limit, add a delay.
-            # Since I'm not sure how Amazon determines at exactly what
-            # point to throttle, better be safe than sorry and let in, say,
-            # half of the allowed rate.
-            if len(new_send_times) > rate_limit * window * self._throttle:
-                # Sleep the remainder of the window period.
-                delta = now - new_send_times[0]
-                total_seconds = (delta.microseconds + (delta.seconds +
-                                                       delta.days * 24 * 3600) * 10**6) / 10**6
-                delay = window - total_seconds
-                if delay > 0:
-                    sleep(delay)
-
-            recent_send_times.append(now)
-            # end of throttling
-
-        exc, sent = None, True
         try:
-            response = self.connection.send_raw_email(
-                Source=source or message.from_email,
-                Destinations=message.recipients(),
-                # todo attachments?
-                RawMessage={'Data': dkim_sign(message.message().as_string(),
-                                              dkim_key=self.dkim_key,
-                                              dkim_domain=self.dkim_domain,
-                                              dkim_selector=self.dkim_selector,
-                                              dkim_headers=self.dkim_headers)}
-            )
-
+            response = (self.connection.send_email(**kwargs)
+                        if self._use_ses_v2
+                        else self.connection.send_raw_email(**kwargs))
             message.extra_headers['status'] = 200
             message.extra_headers['message_id'] = response['MessageId']
             message.extra_headers['request_id'] = response['ResponseMetadata']['RequestId']
+
             if 'X-SES-CONFIGURATION-SET' in message.extra_headers:
                 logger.debug(
-                    u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' "
-                    u"ses-configuration-set='{}'".format(
+                    "send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' "
+                    "ses-configuration-set='{}'".format(
                         message.from_email,
                         ", ".join(message.recipients()),
                         message.extra_headers['message_id'],
@@ -194,50 +211,115 @@ class SESBackend(BaseEmailBackend):
                         message.extra_headers['X-SES-CONFIGURATION-SET']
                     ))
             else:
-                logger.debug(u"send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
+                logger.debug("send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
                     message.from_email,
                     ", ".join(message.recipients()),
                     message.extra_headers['message_id'],
                     message.extra_headers['request_id']
                 ))
-
         except ResponseError as err:
             # Store failure information so to post process it if required
             error_keys = ['status', 'reason', 'body', 'request_id',
-                          'error_code', 'error_message']
+                            'error_code', 'error_message']
             for key in error_keys:
                 message.extra_headers[key] = getattr(err, key, None)
 
-            exc = sys.exc_info()
+            exc_info = sys.exc_info()
             sent = False
         finally:
-            return sent, message, exc
+            return sent, message, exc_info
 
-    def send_messages(self, email_messages):
-        """Sends one or more EmailMessage objects and returns the number of
-        email messages sent.
+    def _update_throttling(self):
+        global recent_send_times
+        now = datetime.now()
+        # Get and cache the current SES max-per-second rate limit
+        # returned by the SES API.
+        rate_limit = self.get_rate_limit()
+        logger.debug(
+            "send_messages.throttle rate_limit='{}'".format(rate_limit))
+        # Prune from recent_send_times anything more than a few seconds
+        # ago. Even though SES reports a maximum per-second, the way
+        # they enforce the limit may not be on a one-second window.
+        # To be safe, we use a two-second window (but allow 2 times the
+        # rate limit) and then also have a default rate limit factor of
+        # 0.5 so that we really limit the one-second amount in two
+        # seconds.
+        window = 2.0  # seconds
+        window_start = now - timedelta(seconds=window)
+        new_send_times = []
+        for time in recent_send_times:
+            if time > window_start:
+                new_send_times.append(time)
+        recent_send_times = new_send_times
+        # If the number of recent send times in the last 1/_throttle
+        # seconds exceeds the rate limit, add a delay.
+        # Since I'm not sure how Amazon determines at exactly what
+        # point to throttle, better be safe than sorry and let in, say,
+        # half of the allowed rate.
+        if len(new_send_times) > rate_limit * window * self._throttle:
+            # Sleep the remainder of the window period.
+            delta = now - new_send_times[0]
+            total_seconds = (delta.microseconds + (delta.seconds +
+                                                   delta.days * 24 * 3600) * 10 ** 6) / 10 ** 6
+            delay = window - total_seconds
+            if delay > 0:
+                sleep(delay)
+        recent_send_times.append(now)
+        # end of throttling
+
+    def _get_send_email_parameters(self, message, source, email_feedack):
+        return (self._get_v2_parameters(message, source, email_feedack)
+                if self._use_ses_v2
+                else self._get_v1_parameters(message, source))
+
+    def _get_v2_parameters(self, message, source, email_feedback):
+        """V2-Style raw payload for `send_email`.
+
+        https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#SESV2.Client.send_email
         """
-        if not email_messages:
-            return
+        params = dict(
+            FromEmailAddress=source or message.from_email,
+            Destination={
+                'ToAddresses': message.recipients()
+            },
+            Content={
+                'Raw': {
+                    'Data': dkim_sign(message.message().as_bytes(linesep="\r\n"),
+                                      dkim_key=self.dkim_key,
+                                      dkim_domain=self.dkim_domain,
+                                      dkim_selector=self.dkim_selector,
+                                      dkim_headers=self.dkim_headers)
+                }
+            }
+        )
+        if self.ses_from_arn or self.ses_source_arn:
+            params['FromEmailAddressIdentityArn'] = self.ses_from_arn or self.ses_source_arn
+        if email_feedback is not None:
+            params['FeedbackForwardingEmailAddress'] = email_feedback
 
-        new_conn_created = self.open()
-        if not self.connection:
-            # Failed silently
-            return
+        return params
 
-        num_sent = 0
-        source = settings.AWS_SES_RETURN_PATH
-        for message in email_messages:
-            sent, message, exc = self._send_message(message, source=source)
-            if not sent and not self.fail_silently:
-                reraise(*exc)
-            if sent:
-                num_sent += 1
+    def _get_v1_parameters(self, message, source):
+        """V1-Style raw payload for `send_raw_email`
 
-        if new_conn_created:
-            self.close()
-
-        return num_sent
+        https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/ses.html#SES.Client.send_raw_email
+        """
+        params = dict(
+            Source=source or message.from_email,
+            Destinations=message.recipients(),
+            RawMessage={'Data': dkim_sign(message.message().as_bytes(linesep="\r\n"),
+                                          dkim_key=self.dkim_key,
+                                          dkim_domain=self.dkim_domain,
+                                          dkim_selector=self.dkim_selector,
+                                          dkim_headers=self.dkim_headers)}
+        )
+        if self.ses_source_arn:
+            params['SourceArn'] = self.ses_source_arn
+        if self.ses_from_arn:
+            params['FromArn'] = self.ses_from_arn
+        if self.ses_return_path_arn:
+            params['ReturnPathArn'] = self.ses_return_path_arn
+        return params
 
     def get_rate_limit(self):
         if self._access_key_id in cached_rate_limits:
@@ -248,11 +330,26 @@ class SESBackend(BaseEmailBackend):
             raise Exception(
                 "No connection is available to check current SES rate limit.")
         try:
-            quota_dict = self.connection.get_send_quota()
-            max_per_second = quota_dict['MaxSendRate']
-            ret = float(max_per_second)
-            cached_rate_limits[self._access_key_id] = ret
-            return ret
+            return self._get_v2_send_quota() if self._use_ses_v2 else self._get_v1_send_quota()
         finally:
             if new_conn_created:
                 self.close()
+
+    def _get_v2_send_quota(self):
+        """This needs to come from the `get_account` endpoint as a nested response in V2.
+
+        https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#SESV2.Client.get_account
+        """
+        account_dict = self.connection.get_account()
+        quota_dict = account_dict['SendQuota']
+        max_per_second = quota_dict['MaxSendRate']
+        ret = float(max_per_second)
+        cached_rate_limits[self._access_key_id] = ret
+        return ret
+
+    def _get_v1_send_quota(self):
+        quota_dict = self.connection.get_send_quota()
+        max_per_second = quota_dict['MaxSendRate']
+        ret = float(max_per_second)
+        cached_rate_limits[self._access_key_id] = ret
+        return ret

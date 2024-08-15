@@ -1,8 +1,9 @@
-from django.conf.urls import url
+from django.urls import path
 
-from django_ses.views import dashboard, handle_bounce
+from django_ses.views import DashboardView, SESEventWebhookView, handle_bounce
 
 urlpatterns = [
-    url(r'^dashboard/$', dashboard, name='django_ses_stats'),
-    url(r'^bounce/$', handle_bounce, name='django_ses_bounce'),
+    path('dashboard/', DashboardView.as_view(), name='django_ses_stats'),
+    path('bounce/', handle_bounce, name='django_ses_bounce'),
+    path('event-webhook/', SESEventWebhookView.as_view(), name='event_webhook'),
 ]
